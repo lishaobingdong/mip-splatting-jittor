@@ -8,6 +8,8 @@ class GaussianRasterizationSettings(NamedTuple):
     image_width: int 
     tanfovx : float
     tanfovy : float
+    kernel_size : float
+    subpixel_offset: jt.Var
     bg : jt.Var
     scale_modifier : float
     viewmatrix : jt.Var
@@ -49,6 +51,8 @@ class _RasterizeGaussians(jt.Function):
             raster_settings.projmatrix,
             raster_settings.tanfovx,
             raster_settings.tanfovy,
+            raster_settings.kernel_size,
+            raster_settings.subpixel_offset,
             raster_settings.image_height,
             raster_settings.image_width,
             sh,
@@ -88,7 +92,9 @@ class _RasterizeGaussians(jt.Function):
                 raster_settings.viewmatrix, 
                 raster_settings.projmatrix, 
                 raster_settings.tanfovx, 
-                raster_settings.tanfovy, 
+                raster_settings.tanfovy,
+                raster_settings.kernel_size,
+                raster_settings.subpixel_offset, 
                 grad_out_color, 
                 sh, 
                 raster_settings.sh_degree, 

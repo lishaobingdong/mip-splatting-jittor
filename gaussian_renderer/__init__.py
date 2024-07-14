@@ -5,14 +5,13 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, kernel_size: float, scaling_modifier = 1.0, override_color = None, subpixel_offset=None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
  
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = pc.screenspace_points
     # try:
     #     screenspace_points.retain_grad()
@@ -23,11 +22,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
+    if subpixel_offset is None:
+        subpixel_offset = jt.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=jt.float32)
+
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
+        kernel_size=kernel_size,
+        subpixel_offset=subpixel_offset,
         bg=bg_color,
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
@@ -42,7 +46,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
 
     means3D = pc.get_xyz
     means2D = screenspace_points
-    opacity = pc.get_opacity
+    opacity = pc.get_opacity_with_3D_filter
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -52,7 +56,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
-        scales = pc.get_scaling
+        scales = pc.get_scaling_with_3D_filter
         rotations = pc.get_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors

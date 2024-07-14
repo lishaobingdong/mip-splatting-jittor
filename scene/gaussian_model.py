@@ -20,6 +20,10 @@ from utils.sh_utils import RGB2SH
 from scene.simple_knn import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+import pdb
+
+def min(a,b):
+    return jt.where(a<b,a,b)
 
 class GaussianModel:
 
@@ -97,6 +101,14 @@ class GaussianModel:
         return self.scaling_activation(self._scaling)
     
     @property
+    def get_scaling_with_3D_filter(self):
+        scales = self.get_scaling
+        
+        scales = jt.sqr(scales) + jt.sqr(self.filter_3D)
+        scales = jt.sqrt(scales)
+        return scales
+    
+    @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
     
@@ -114,12 +126,80 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
+    @property
+    def get_opacity_with_3D_filter(self):
+        # pdb.set_trace()
+        opacity = self.opacity_activation(self._opacity)
+        # apply 3D filter
+        scales = self.get_scaling
+        
+        scales_square = jt.sqr(scales)
+        det1 = scales_square.prod(dim=1)
+        
+        scales_after_square = scales_square + jt.sqr(self.filter_3D) 
+        det2 = scales_after_square.prod(dim=1) 
+        coef = jt.sqrt(det1 / det2)
+        return opacity * coef[..., None]
+    
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+
+    @jt.no_grad()
+    def compute_3D_filter(self, cameras):
+        # import pdb
+        # pdb.set_trace()
+        print("Computing 3D filter")
+        #TODO consider focal length and image width
+        xyz = self.get_xyz
+        distance = jt.ones((xyz.shape[0])) * 100000.0
+        valid_points = jt.zeros((xyz.shape[0]), dtype=jt.bool)
+        
+        # we should use the focal length of the highest resolution camera
+        focal_length = 0.
+        for camera in cameras:
+
+            # transform points to camera space
+            R = jt.array(camera.R, dtype=jt.float32)
+            T = jt.array(camera.T, dtype=jt.float32)
+             # R is stored transposed due to 'glm' in CUDA code so we don't neet transopse here
+            xyz_cam = xyz @ R + T[None, :]
+            
+            xyz_to_cam = jt.norm(xyz_cam, dim=1)
+            
+            # project to screen space
+            valid_depth = xyz_cam[:, 2] > 0.2
+            
+            
+            x, y, z = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
+            z = jt.clamp(z, min_v=0.001)
+            
+            x = x / z * camera.focal_x + camera.image_width / 2.0
+            y = y / z * camera.focal_y + camera.image_height / 2.0
+            
+            # in_screen = torch.logical_and(torch.logical_and(x >= 0, x < camera.image_width), torch.logical_and(y >= 0, y < camera.image_height))
+            
+            # use similar tangent space filtering as in the paper
+            in_screen = jt.logical_and(jt.logical_and(x >= -0.15 * camera.image_width, x <= camera.image_width * 1.15), jt.logical_and(y >= -0.15 * camera.image_height, y <= 1.15 * camera.image_height))
+            
+        
+            valid = jt.logical_and(valid_depth, in_screen)
+            
+            # distance[valid] = torch.min(distance[valid], xyz_to_cam[valid])
+            distance[valid] = min(distance[valid], z[valid])
+            valid_points = jt.logical_or(valid_points, valid)
+            if focal_length < camera.focal_x:
+                focal_length = camera.focal_x
+        # pdb.set_trace()
+        distance[jt.logical_not(valid_points)] = distance[valid_points].max()
+        
+        #TODO remove hard coded value
+        #TODO box to gaussian transform
+        filter_3D = distance / focal_length * (0.2 ** 0.5) #最小采样间隔
+        self.filter_3D = filter_3D[..., None]
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
@@ -159,7 +239,8 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = jt.zeros((self.get_xyz.shape[0], 1))
         self.denom = jt.zeros((self.get_xyz.shape[0], 1))
-
+        # import pdb
+        # pdb.set_trace()
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -199,7 +280,7 @@ class GaussianModel:
                 param_group['lr'] = lr
                 return lr
 
-    def construct_list_of_attributes(self):
+    def construct_list_of_attributes(self, exclude_filter=False):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         # All channels except the 3 DC
         for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
@@ -211,6 +292,8 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        if not exclude_filter:
+            l.append('filter_3D')
         return l
 
     def save_ply(self, path):
@@ -224,7 +307,30 @@ class GaussianModel:
         scale = self._scaling.detach().numpy()
         rotation = self._rotation.detach().numpy()
 
+        filter_3D = self.filter_3D.detach().cpu().numpy()
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, filter_3D), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)
+
+    def save_fused_ply(self, path):
+        mkdir_p(os.path.dirname(path))
+
+        xyz = self._xyz.detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        # fuse opacity and scale
+        current_opacity_with_filter = self.get_opacity_with_3D_filter
+        opacities = inverse_sigmoid(current_opacity_with_filter).detach().cpu().numpy()
+        scale = self.scaling_inverse_activation(self.get_scaling_with_3D_filter).detach().cpu().numpy()
+        
+        rotation = self._rotation.detach().cpu().numpy()
+
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes(exclude_filter=True)]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
@@ -233,9 +339,21 @@ class GaussianModel:
         PlyData([el]).write(path)
 
     def reset_opacity(self):
-        def min(a,b):
-            return jt.where(a<b,a,b)
-        opacities_new = inverse_sigmoid(min(self.get_opacity, jt.ones_like(self.get_opacity)*0.01))
+        current_opacity_with_filter = self.get_opacity_with_3D_filter
+        opacities_new = min(current_opacity_with_filter, jt.ones_like(current_opacity_with_filter)*0.01)
+
+        # apply 3D filter
+        scales = self.get_scaling
+        
+        scales_square = jt.sqr(scales)
+        det1 = scales_square.prod(dim=1)
+        
+        scales_after_square = scales_square + jt.sqr(self.filter_3D) 
+        det2 = scales_after_square.prod(dim=1) 
+        coef = jt.sqrt(det1 / det2)
+        opacities_new = opacities_new / coef[..., None]
+        opacities_new = inverse_sigmoid(opacities_new)
+
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
@@ -246,6 +364,8 @@ class GaussianModel:
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+
+        filter_3D = np.asarray(plydata.elements[0]["filter_3D"])[..., np.newaxis]
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -280,6 +400,7 @@ class GaussianModel:
         self._scaling = jt.array(scales, dtype=jt.float)
         self._rotation = jt.array(rots, dtype=jt.float)
         self.screenspace_points = jt.zeros_like(self.get_xyz, dtype=self.get_xyz.dtype) + 0
+        self.filter_3D = jt.array(filter_3D, dtype=jt.float)
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):

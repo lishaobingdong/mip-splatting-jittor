@@ -31,15 +31,15 @@ def save_image(mat,path):
     mat = mat[:,:,[2,1,0]].clamp(0,1) * 255
     cv2.imwrite(path,mat.numpy().astype(np.uint8))
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, scale_factor):
+    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), f"test_preds_{scale_factor}")
+    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), f"gt_{scale_factor}")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        rendering = render(view, gaussians, pipeline, background)["render"]
+        rendering = render(view, gaussians, pipeline, background, kernel_size=kernel_size)["render"]
         gt = view.original_image[0:3, :, :]
         save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
@@ -48,16 +48,15 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     with jt.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-
+        scale_factor = dataset.resolution
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = jt.array(bg_color, dtype=jt.float32)
-
+        kernel_size = dataset.kernel_size
         if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, kernel_size, scale_factor=scale_factor)
 
-        if not skip_test:
-            
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+        if not skip_test:      
+             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, kernel_size, scale_factor=scale_factor)
 
 if __name__ == "__main__":
     # Set up command line argument parser

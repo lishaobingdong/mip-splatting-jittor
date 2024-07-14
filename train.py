@@ -9,11 +9,16 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+# print("train.py第一行\n")
 import os
+import time
 import jittor as jt
+print("import jittor\n")
+import random
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -22,6 +27,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import pdb
 try:
     from tensorboardX import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -29,6 +35,20 @@ except ImportError:
     TENSORBOARD_FOUND = False
 jt.flags.use_cuda = 1
 
+@jt.no_grad()
+def create_offset_gt(image, offset):
+    height, width = image.shape[1:]
+    meshgrid = np.meshgrid(range(width), range(height), indexing='xy')
+    id_coords = np.stack(meshgrid, axis=0).astype(np.float32)
+    id_coords = jt.array(id_coords)
+    
+    id_coords = id_coords.permute(1, 2, 0) + offset
+    id_coords[..., 0] /= (width - 1)
+    id_coords[..., 1] /= (height - 1)
+    id_coords = id_coords * 2 - 1
+    
+    image = jt.nn.grid_sample(image[None], id_coords[None], align_corners=True, padding_mode="border")[0]
+    return image
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
@@ -42,30 +62,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = jt.array(bg_color, dtype=jt.float32)
+    
+    trainCameras = scene.getTrainCameras().copy()
+    testCameras = scene.getTestCameras().copy()
+    allCameras = trainCameras + testCameras
+    
+    # highresolution index
+    highresolution_index = []
+    for index, camera in enumerate(trainCameras):
+        if camera.image_width >= 800:
+            highresolution_index.append(index)   
 
-    # iter_start = torch.cuda.Event(enable_timing = True)
-    # iter_end = torch.cuda.Event(enable_timing = True)
+    gaussians.compute_3D_filter(cameras=trainCameras)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
-        # if network_gui.conn == None:
-        #     network_gui.try_connect()
-        # while network_gui.conn != None:
-        #     try:
-        #         net_image_bytes = None
-        #         custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-        #         if custom_cam != None:
-        #             net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-        #             net_image_bytes = memoryview((jt.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).numpy())
-        #         network_gui.send(net_image_bytes, dataset.source_path)
-        #         if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-        #             break
-        #     except Exception as e:
-        #         network_gui.conn = None
-
         gaussians.update_learning_rate(iteration)
         if iteration < opt.densify_until_iter:
             gaussians.reset_viewspace_point()
@@ -79,19 +93,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
+        # Pick a random high resolution camera
+        if random.random() < 0.3 and dataset.sample_more_highres:
+            viewpoint_cam = trainCameras[highresolution_index[randint(0, len(highresolution_index)-1)]]
+
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = jt.rand((3)) if opt.random_background else background
-
-
+        #TODO ignore border pixels
+        if dataset.ray_jitter:
+            subpixel_offset = jt.rand((int(viewpoint_cam.image_height), int(viewpoint_cam.image_width), 2), dtype=jt.float32) - 0.5
+            # subpixel_offset *= 0.0
+        else:
+            subpixel_offset = None
         
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, subpixel_offset=subpixel_offset)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
         gt_image = viewpoint_cam.original_image
+        # sample gt_image with subpixel offset
+        if dataset.resample_gt_image:
+            gt_image = create_offset_gt(gt_image, subpixel_offset)
+
         Ll1 = l1_loss(image, gt_image)
         # print(Ll1.item()) 
 
@@ -115,7 +140,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations, scene, render, (pipe, background, dataset.kernel_size))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -132,30 +157,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    gaussians.compute_3D_filter(cameras=trainCameras)
                     update_flag = True
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    
                     gaussians.reset_opacity()
-                if (iteration in checkpoint_iterations):
-                    print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                    jt.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-        # Optimizer step
+                
+            if iteration % 100 == 0 and iteration > opt.densify_until_iter:
+                if iteration < opt.iterations - 100:
+                    # don't update in the end of training
+                    gaussians.compute_3D_filter(cameras=trainCameras)
+            
+            if (iteration in checkpoint_iterations):
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                jt.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
         if iteration < opt.iterations:
-            # if iteration >= 600:
-            #     points_old = gaussians.optimizer.param_groups[0]['params'][0].clone()
             if not update_flag:
                 gaussians.optimizer.step()
-            # if iteration >= 600:
-
-            #     points_new = gaussians.optimizer.param_groups[0]['params'][0].clone()
-            #     print((points_new - points_old).nonzero().shape)
-            #     breakpoint()
-                
             gaussians.optimizer.zero_grad()
-
                 
-
-            
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -186,6 +207,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations
 
     # Report test and samples of training set
     if iteration in testing_iterations:
+        jt.gc()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
@@ -213,14 +235,19 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity.numpy(), iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        jt.gc()
 
 
 if __name__ == "__main__":
     # Set up command line argument parser
+    jt.sync_all()
+    start = time.time()
+    
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+    # pdb.set_trace()
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
@@ -244,4 +271,9 @@ if __name__ == "__main__":
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done
-    print("\nTraining complete.")
+    jt.sync_all()
+    end = time.time()
+    print(f"\nTraining complete, cost {end-start}seconds\n")
+    
+    with open('log.txt', 'a') as file:
+        print(f'{args.model_path} cost time: {end-start}seconds\n')

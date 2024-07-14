@@ -54,6 +54,12 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self._kernel_size = 0.3
+        # self.use_spatial_gaussian_bias = False
+        self.ray_jitter = False
+        self.resample_gt_image = False
+        self.load_allres = False
+        self.sample_more_highres = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -84,9 +90,8 @@ class OptimizationParams(ParamGroup):
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
+        self.densify_until_iter = 15_000 #15_000
         self.densify_grad_threshold = 0.0002
-        self.random_background = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
